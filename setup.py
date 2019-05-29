@@ -21,6 +21,7 @@ setup(
     description=description,
     long_description=long_description,
     long_description_content_type='text/markdown',
+    extras_require={"toml": ["toml"]},
     entry_points={
         'console_scripts': [
             'bumpversion = bumpversion.cli:main',

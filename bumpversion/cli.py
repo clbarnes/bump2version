@@ -2,6 +2,7 @@
 from __future__ import unicode_literals
 
 import argparse
+from copy import deepcopy
 from datetime import datetime
 import io
 import logging
@@ -10,6 +11,8 @@ import re
 import sre_constants
 import sys
 import warnings
+
+import toml
 
 from bumpversion import __version__, __title__
 from bumpversion.version_part import (
@@ -87,6 +90,262 @@ def split_args_in_optional_and_positional(args):
     args = [arg for i, arg in enumerate(args) if i not in positions]
 
     return (positionals, args)
+
+
+class ConfigurationFile(dict):
+    def __init__(self, d, defaults=None):
+        super(ConfigurationFile, self).__init__(**d)
+
+        self.defaults = defaults or dict()
+
+        if "files" in self:
+            warnings.warn(
+                "'files =' configuration will be deprecated, please use [bumpversion:file:...]",
+                PendingDeprecationWarning,
+            )
+
+        for key in ["serialize", "commit", "tag", "dry_run"]:
+            self.defaults[key] = self[key]
+
+        for key in ["part", "file"]:
+            self[key] = self.get(key, dict())
+
+        for file_config in self["file"].values():
+            if "parse" not in file_config:
+                file_config["parse"] = self.defaults.get(
+                    "parse", r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+                )
+
+            if "serialize" not in file_config:
+                file_config["serialize"] = self.defaults.get(
+                    "serialize", ["{major}.{minor}.{patch}"]
+                )
+
+            if "search" not in file_config:
+                file_config["search"] = self.defaults.get(
+                    "search", "{current_version}"
+                )
+
+            if "replace" not in file_config:
+                file_config["replace"] = self.defaults.get("replace", "{new_version}")
+
+    def part_file_configs(self):
+        part_configs = dict()
+
+        for part_name, part_config in self["part"].items():
+            ThisVersionPartConfiguration = NumericVersionPartConfiguration
+            if "values" in part_config:
+                ThisVersionPartConfiguration = ConfiguredVersionPartConfiguration
+            part_configs[part_name] = ThisVersionPartConfiguration(
+                **part_config
+            )
+
+        files = []
+
+        for filename, file_config in self["file"].items():
+            file_config = deepcopy(file_config)
+            file_config["part_configs"] = part_configs
+
+            files.append(ConfiguredFile(filename, VersionConfig(**file_config)))
+
+        return part_configs, files
+
+
+
+
+def parse_toml(toml_path, defaults, parent_key=None):
+    d = toml.load(toml_path)
+    if parent_key is not None:
+        if isinstance(parent_key, (list, tuple)):
+            for item in parent_key:
+                d = d[item]
+        else:
+            d = d[parent_key]
+
+    if "bumpversion" not in d:
+        return defaults
+
+    if "files" in d["bumpversion"]:
+        warnings.warn(
+            "'files =' configuration will be deprecated, please use [bumpversion:file:...]",
+            PendingDeprecationWarning,
+        )
+
+    defaults.update(dict((k, v) for k, v in d["bumpversion"].items() if not v.isinstance(dict)))
+
+    part_configs = dict()
+
+    for part in d["bumpversion"].get("part", []):
+        ThisVersionPartConfiguration = NumericVersionPartConfiguration
+        for part_name, part_config in part.items():
+            if "values" in part_config:
+                ThisVersionPartConfiguration = ConfiguredVersionPartConfiguration
+            part_configs[part_name] = ThisVersionPartConfiguration(
+                **part_config
+            )
+
+    files = []
+
+    for file_ in d["bumpversion"].get("file", []):
+        for filename, file_config in file_.items():
+            file_config["part_configs"] = part_configs
+
+            if "parse" not in file_config:
+                file_config["parse"] = defaults.get(
+                    "parse", r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+                )
+
+            if "serialize" not in file_config:
+                file_config["serialize"] = defaults.get(
+                    "serialize", ["{major}.{minor}.{patch}"]
+                )
+
+            if "search" not in file_config:
+                file_config["search"] = defaults.get(
+                    "search", "{current_version}"
+                )
+
+            if "replace" not in file_config:
+                file_config["replace"] = defaults.get("replace", "{new_version}")
+
+            files.append(ConfiguredFile(filename, VersionConfig(**file_config)))
+
+    return part_configs, files
+
+
+def parse_ini(ini_path, defaults, explicit_config=False):
+    # setup.cfg supports interpolation - for compatibility we must do the same.
+    if os.path.basename(ini_path) == "setup.cfg":
+        config = ConfigParser("")
+    else:
+        config = RawConfigParser("")
+
+    # don't transform keys to lowercase (which would be the default)
+    config.optionxform = lambda option: option
+
+    config.add_section("bumpversion")
+
+    config_file_exists = os.path.exists(ini_path)
+
+    part_configs = {}
+
+    files = []
+
+    if config_file_exists:
+
+        logger.info("Reading config file {}:".format(ini_path))
+        # TODO: this is a DEBUG level log
+        logger.info(io.open(ini_path, "rt", encoding="utf-8").read())
+
+        try:
+            # TODO: we're reading the config file twice.
+            config.read_file(io.open(ini_path, "rt", encoding="utf-8"))
+        except AttributeError:
+            # python 2 standard ConfigParser doesn't have read_file,
+            # only deprecated readfp
+            config.readfp(io.open(ini_path, "rt", encoding="utf-8"))
+
+        log_config = StringIO()
+        config.write(log_config)
+
+        if "files" in dict(config.items("bumpversion")):
+            warnings.warn(
+                "'files =' configuration will be deprecated, please use [bumpversion:file:...]",
+                PendingDeprecationWarning,
+            )
+
+        defaults.update(dict(config.items("bumpversion")))
+
+        for listvaluename in ("serialize",):
+            try:
+                value = config.get("bumpversion", listvaluename)
+                defaults[listvaluename] = list(
+                    filter(None, (x.strip() for x in value.splitlines()))
+                )
+            except NoOptionError:
+                pass  # no default value then ;)
+
+        for boolvaluename in ("commit", "tag", "dry_run"):
+            try:
+                defaults[boolvaluename] = config.getboolean(
+                    "bumpversion", boolvaluename
+                )
+            except NoOptionError:
+                pass  # no default value then ;)
+
+        for section_name in config.sections():
+
+            section_name_match = re.compile("^bumpversion:(file|part):(.+)").match(
+                section_name
+            )
+
+            if not section_name_match:
+                continue
+
+            section_prefix, section_value = section_name_match.groups()
+
+            section_config = dict(config.items(section_name))
+
+            if section_prefix == "part":
+
+                ThisVersionPartConfiguration = NumericVersionPartConfiguration
+
+                if "values" in section_config:
+                    section_config["values"] = list(
+                        filter(
+                            None,
+                            (x.strip() for x in section_config["values"].splitlines()),
+                        )
+                    )
+                    ThisVersionPartConfiguration = ConfiguredVersionPartConfiguration
+
+                part_configs[section_value] = ThisVersionPartConfiguration(
+                    **section_config
+                )
+
+            elif section_prefix == "file":
+
+                filename = section_value
+
+                if "serialize" in section_config:
+                    section_config["serialize"] = list(
+                        filter(
+                            None,
+                            (
+                                x.strip().replace("\\n", "\n")
+                                for x in section_config["serialize"].splitlines()
+                            ),
+                        )
+                    )
+
+                section_config["part_configs"] = part_configs
+
+                if "parse" not in section_config:
+                    section_config["parse"] = defaults.get(
+                        "parse", r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+                    )
+
+                if "serialize" not in section_config:
+                    section_config["serialize"] = defaults.get(
+                        "serialize", [str("{major}.{minor}.{patch}")]
+                    )
+
+                if "search" not in section_config:
+                    section_config["search"] = defaults.get(
+                        "search", "{current_version}"
+                    )
+
+                if "replace" not in section_config:
+                    section_config["replace"] = defaults.get("replace", "{new_version}")
+
+                files.append(ConfiguredFile(filename, VersionConfig(**section_config)))
+    else:
+        message = "Could not read config file at {}".format(ini_path)
+        if explicit_config:
+            raise argparse.ArgumentTypeError(message)
+        logger.info(message)
+
+    return part_configs, files
 
 
 def main(original_args=None):
