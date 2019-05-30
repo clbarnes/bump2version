@@ -92,25 +92,22 @@ def split_args_in_optional_and_positional(args):
     return (positionals, args)
 
 
-class ConfigurationFile(dict):
-    def __init__(self, d, defaults=None):
-        super(ConfigurationFile, self).__init__(**d)
-
+class ConfigurationFile:
+    def __init__(self, root=None, part=None, file=None, defaults=None):
+        self.root = root or dict()
+        self.part = part or dict()
+        self.file = file or dict()
         self.defaults = defaults or dict()
 
-        if "files" in self:
+        self.defaults.update(self.root)
+
+        if "files" in root:
             warnings.warn(
                 "'files =' configuration will be deprecated, please use [bumpversion:file:...]",
                 PendingDeprecationWarning,
             )
 
-        for key in ["serialize", "commit", "tag", "dry_run"]:
-            self.defaults[key] = self[key]
-
-        for key in ["part", "file"]:
-            self[key] = self.get(key, dict())
-
-        for file_config in self["file"].values():
+        for file_config in self.file.values():
             if "parse" not in file_config:
                 file_config["parse"] = self.defaults.get(
                     "parse", r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
@@ -150,6 +147,141 @@ class ConfigurationFile(dict):
 
         return part_configs, files
 
+    @classmethod
+    def copy_from(cls, configuration_obj):
+        return cls(
+            configuration_obj.root,
+            configuration_obj.part,
+            configuration_obj.file,
+            configuration_obj.defaults
+        )
+
+
+class ConfigurationToml(ConfigurationFile):
+    @classmethod
+    def read(cls, fpath, parent_keys=None, defaults=None):
+        parent_keys = parent_keys or []
+        d = toml.load(fpath)
+        for key_part in parent_keys:
+            d = d[key_part]
+
+        part = d.pop('part', dict())
+        file = d.pop('file', dict())
+        return cls(d, part, file, defaults)
+
+    def write(self, fpath, parent_keys=None):
+        parent_keys = parent_keys or []
+
+        if os.path.exists(fpath):
+            out = toml.load(fpath)
+        else:
+            out = dict()
+
+        this = out
+        for p in parent_keys:
+            if p not in this:
+                this[p] = dict()
+
+            this = this[p]
+
+        this.clear()
+        this.update(self.root)
+        this["file"] = deepcopy(self.file)
+        this["part"] = deepcopy(self.part)
+
+        with open(fpath, 'w') as f:
+            toml.dump(out, f)
+
+
+class ConfigurationIni(ConfigurationFile):
+    @classmethod
+    def read(cls, fpath, parent_keys=None, defaults=None):
+        parent_keys = parent_keys or []
+        prefix = ':'.join(parent_keys)
+
+        if os.path.basename(fpath) == "setup.cfg":
+            config = ConfigParser("")
+        else:
+            config = RawConfigParser("")
+
+        try:
+            # TODO: we're reading the config file twice.
+            config.read_file(io.open(fpath, "rt", encoding="utf-8"))
+        except AttributeError:
+            # python 2 standard ConfigParser doesn't have read_file,
+            # only deprecated readfp
+            config.readfp(io.open(fpath, "rt", encoding="utf-8"))
+
+        root = dict(config.items(prefix))
+
+        for listvaluename in ("serialize",):
+            try:
+                root[listvaluename] = cls._loads_list(root[listvaluename])
+            except KeyError:
+                pass
+
+        for boolvaluename in ("commit", "tag", "dry_run"):
+            try:
+                root[boolvaluename] = cls._loads_bool(root[boolvaluename])
+            except KeyError:
+                pass  # no default value then ;)
+
+        file = dict()
+        part = dict()
+
+        for section in config.sections():
+            if section.startswith(prefix + ':file:'):
+                filename = section[len(prefix) + len(':file:'):]
+                file_d = dict(config.items(section))
+
+                if "serialize" in file_d:
+                    file_d["serialize"] = cls._loads_list(file_d["serialize"])
+
+                file[filename] = file_d
+            elif section.startswith(prefix + ':part:'):
+                partname = section[len(prefix) + len(':part:'):]
+                part_d = dict(config.items(section))
+
+                if "values" in part_d:
+                    part_d["values"] = cls._loads_list(part_d["values"])
+
+                part[partname] = part_d
+
+        return cls(root, part, file, defaults)
+
+    def write(self, fpath, parent_keys=None):
+        if parent_keys is None:
+            parent_keys = []
+
+        # todo
+
+    @staticmethod
+    def _loads_list(s):
+        return [x.strip().replace("\\n", "\n") for x in s.splitlines() if x.strip()]
+
+    @staticmethod
+    def _dumps_list(lst):
+        return '\n'.join(s.replace('\n', "\\n") for s in lst)
+
+    @staticmethod
+    def _loads_bool(s):
+        return {
+            "1": True,
+            "true": True,
+            "on": True,
+            "yes": True,
+            "0": False,
+            "false": False,
+            "off": False,
+            "no": False,
+        }[s.lower()]
+
+    @staticmethod
+    def _dumps_bool(val):
+        return ["True", "False"][int(val)]
+
+
+
 
 
 
@@ -173,42 +305,6 @@ def parse_toml(toml_path, defaults, parent_key=None):
 
     defaults.update(dict((k, v) for k, v in d["bumpversion"].items() if not v.isinstance(dict)))
 
-    part_configs = dict()
-
-    for part in d["bumpversion"].get("part", []):
-        ThisVersionPartConfiguration = NumericVersionPartConfiguration
-        for part_name, part_config in part.items():
-            if "values" in part_config:
-                ThisVersionPartConfiguration = ConfiguredVersionPartConfiguration
-            part_configs[part_name] = ThisVersionPartConfiguration(
-                **part_config
-            )
-
-    files = []
-
-    for file_ in d["bumpversion"].get("file", []):
-        for filename, file_config in file_.items():
-            file_config["part_configs"] = part_configs
-
-            if "parse" not in file_config:
-                file_config["parse"] = defaults.get(
-                    "parse", r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
-                )
-
-            if "serialize" not in file_config:
-                file_config["serialize"] = defaults.get(
-                    "serialize", ["{major}.{minor}.{patch}"]
-                )
-
-            if "search" not in file_config:
-                file_config["search"] = defaults.get(
-                    "search", "{current_version}"
-                )
-
-            if "replace" not in file_config:
-                file_config["replace"] = defaults.get("replace", "{new_version}")
-
-            files.append(ConfiguredFile(filename, VersionConfig(**file_config)))
 
     return part_configs, files
 
